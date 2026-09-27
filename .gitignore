@@ -1,0 +1,13 @@
+# secrets & local state — never commit
+session.json
+terminal-standalone.html
+bridge.pid
+bridge.lock
+*.log
+
+# deps & fetched libs
+node_modules/
+vendor/
+
+# OS
+.DS_Store

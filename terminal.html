@@ -1,0 +1,110 @@
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.css" />
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.1.0/mqttws31.min.js"></script>
+<div style="box-sizing:border-box;max-width:100%;border:1px solid var(--hatch-widget-border);border-radius:10px;overflow:hidden;background:var(--hatch-widget-surface);">
+  <div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--hatch-widget-border);">
+    <span style="width:10px;height:10px;border-radius:50%;background:var(--hatch-widget-accent);" id="tdot"></span>
+    <span id="tstat" style="font-size:13px;color:var(--hatch-widget-muted);">正在连接终端…</span>
+    <span style="flex:1"></span>
+    <button id="tclose" style="font-size:12px;padding:4px 10px;border-radius:6px;border:1px solid var(--hatch-widget-border);background:var(--hatch-widget-surface-muted);color:var(--hatch-widget-text);cursor:pointer;">结束会话</button>
+  </div>
+  <div id="tterm" style="height:420px;background:#0b0e14;padding:6px;"></div>
+  <div style="padding:6px 12px;font-size:11px;color:var(--hatch-widget-muted);border-top:1px solid var(--hatch-widget-border);">容器终端 · 常驻连接（容器重启后自动恢复）· 请勿在此输入密码等敏感信息</div>
+</div>
+<script>
+(function(){
+  var TOKEN = "PASTE_TOKEN_FROM_SESSION_JSON";
+  var KEYB64 = "PASTE_KEY_FROM_SESSION_JSON";
+  var TOPIC_I = "ht/" + TOKEN + "/i";
+  var TOPIC_O = "ht/" + TOKEN + "/o";
+  var BROKER = "wss://broker.emqx.io:8084/mqtt";
+
+  var term = new Terminal({ cursorBlink: true, fontSize: 13, fontFamily: 'Menlo, Consolas, monospace',
+    theme: { background: '#0b0e14', foreground: '#e6e6e6' } });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('tterm'));
+  fit.fit();
+  term.writeln('\x1b[90m正在通过加密中继连接容器终端…\x1b[0m');
+
+  function b64ToBytes(s){ var b = atob(s), o = new Uint8Array(b.length); for (var i=0;i<b.length;i++) o[i]=b.charCodeAt(i); return o; }
+  function bytesToB64(b){ var s=''; for (var i=0;i<b.length;i+=8192) s += String.fromCharCode.apply(null, b.subarray(i,i+8192)); return btoa(s); }
+  var aesKey = null;
+  crypto.subtle.importKey('raw', b64ToBytes(KEYB64), 'AES-GCM', false, ['encrypt','decrypt']).then(function(k){ aesKey = k; });
+
+  function encObj(obj){
+    var iv = crypto.getRandomValues(new Uint8Array(12));
+    var pt = new TextEncoder().encode(JSON.stringify(obj));
+    return crypto.subtle.encrypt({name:'AES-GCM', iv:iv}, aesKey, pt).then(function(buf){
+      var c = new Uint8Array(buf), tag = c.slice(c.length-16), data = c.slice(0, c.length-16);
+      var out = new Uint8Array(12+16+data.length);
+      out.set(iv,0); out.set(tag,12); out.set(data,28);
+      return bytesToB64(out);
+    });
+  }
+  function decStr(s){
+    var b = b64ToBytes(s), iv = b.slice(0,12), tag = b.slice(12,28), ct = b.slice(28);
+    var data = new Uint8Array(ct.length+16); data.set(ct,0); data.set(tag,ct.length);
+    return crypto.subtle.decrypt({name:'AES-GCM', iv:iv}, aesKey, data).then(function(pt){
+      return JSON.parse(new TextDecoder().decode(pt));
+    });
+  }
+  function send(obj){
+    if (!aesKey || !client || !client.isConnected()) return;
+    encObj(obj).then(function(p){
+      var CH = 12000;
+      for (var i=0;i<p.length;i+=CH)
+        client.send(TOPIC_I, p.slice(i,i+CH) + (i+CH<p.length ? '~+' : '~.'), 0, false);
+    });
+  }
+
+  var pending = '';
+  function onPayload(payload){
+    var plus = payload.slice(-2) === '~+';
+    var chunk = payload.slice(0, -2);
+    pending += chunk;
+    if (plus) return;
+    var raw = pending; pending = '';
+    decStr(raw).then(function(m){
+      if (m.t === 'd') term.write(m.d);
+      else if (m.t === 'ready') setStat('已连接 · 容器终端在线', true);
+      else if (m.t === 'e') doEnd('会话已结束：' + m.d);
+    }).catch(function(){});
+  }
+
+  var client = null, statEl = document.getElementById('tstat'), dotEl = document.getElementById('tdot');
+  var userEnded = false;
+  function setStat(t, ok){ statEl.textContent = t; dotEl.style.background = ok ? '#22c55e' : 'var(--hatch-widget-accent)'; }
+  function doEnd(msg){
+    userEnded = true;
+    try { if (client && client.isConnected()) client.disconnect(); } catch(e){}
+    setStat(msg || '会话已结束', false);
+    term.writeln('\r\n\x1b[33m[' + (msg || '会话已结束') + ']\x1b[0m');
+    var btn = document.getElementById('tclose'); if (btn) btn.disabled = true;
+  }
+
+  function connect(){
+    setStat('正在连接中继…', false);
+    var PahoNS = window.Paho || {};
+    var PahoClient = PahoNS.Client || (PahoNS.MQTT && PahoNS.MQTT.Client);
+    if (!PahoClient) { setStat('MQTT 库未加载，请刷新重试', false); return; }
+    client = new PahoClient(BROKER, 'hatch-web-' + TOKEN.slice(0,8) + Math.floor(Math.random()*1e6));
+    client.onConnectionLost = function(){ if (userEnded) return; setStat('连接断开，5 秒后重试…', false); setTimeout(connect, 5000); };
+    client.onMessageArrived = function(msg){ if (msg.destinationName === TOPIC_O) onPayload(msg.payloadString); };
+    client.connect({ useSSL: true, timeout: 15,
+      onSuccess: function(){
+        client.subscribe(TOPIC_O, {qos: 0});
+        setStat('已连上中继，等待终端响应…', false);
+        send({t:'hello'});
+        send({t:'r', c: term.cols, r: term.rows});
+      },
+      onFailure: function(){ if (userEnded) return; setStat('连接失败，5 秒后重试…', false); setTimeout(connect, 5000); }
+    });
+  }
+  term.onData(function(d){ send({t:'d', d:d}); });
+  window.addEventListener('resize', function(){ try{ fit.fit(); send({t:'r', c: term.cols, r: term.rows}); }catch(e){} });
+  document.getElementById('tclose').onclick = function(){ send({t:'x'}); setStat('正在结束会话…', false); setTimeout(function(){ doEnd('会话已结束'); }, 2500); };
+  var ivl = setInterval(function(){ if (aesKey) { clearInterval(ivl); connect(); } }, 200);
+})();
+</script>
